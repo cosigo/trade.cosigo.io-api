@@ -6,11 +6,21 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 3012);
 const DATA_DIR = process.env.TRADE_REQUESTS_DIR || '/srv/data/trade-requests';
 const ADMIN_KEY = process.env.TRADE_ADMIN_KEY || '';
+const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 
 const INDEX_FILE = path.join(DATA_DIR, 'index.json');
 
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const TROY_OUNCE_MG = 31103.4768;
+
+const CIGO_TOKEN_ADDRESS = '0x3a38e963f524E0dDFB75dFa1752b4Cd1364F5560';
+const CIGO_CUSTODIAN_ADDRESS = '0x2B1B5E58C096d4ab402FEfBaa65f2b1Ddc399399';
+const CIGO_TREASURY_ADDRESS = '0x8215C297A3303449787cCA34bBAed1DF929Fd2a9';
+const CIGO_DECIMALS = 18;
+
+const TRADE_NOTIFY_URL = 'https://contact.cosigo.io/api/mail.php';
+const TRADE_NOTIFY_NAME = 'trade.cosigo.io notifier';
+const TRADE_NOTIFY_EMAIL = process.env.TRADE_NOTIFY_EMAIL || 'admin@cosigo.io';
 
 const DEFAULT_SETTINGS = {
   ozUsdReference: 100,
@@ -24,9 +34,53 @@ const DEFAULT_SETTINGS = {
   inventoryCigo: 210000,
   depthFactor: 0.25,
 
+  usdtDailyWalletCap: 1000,
+
   version: 1,
   updatedAt: null
 };
+
+async function sendTradeSubmittedEmail(record) {
+  const form = new URLSearchParams();
+
+  form.set('_gotcha', '');
+  form.set('_redirect', 'https://trade.cosigo.io/admin.html');
+  form.set('site', 'trade.cosigo.io');
+  form.set('page', `request:${record.id}`);
+  form.set('subject', `[trade.cosigo.io] submitted request ${record.id}`);
+  form.set('name', TRADE_NOTIFY_NAME);
+  form.set('email', TRADE_NOTIFY_EMAIL);
+  form.set(
+    'message',
+    [
+      'A new trade request is waiting for review.',
+      '',
+      `Request ID: ${record.id}`,
+      `Status: ${record.status}`,
+      `Wallet: ${record.wallet}`,
+      `Route: ${record.route}`,
+      `Input: ${record.inputAmount} ${record.fromAsset}`,
+      `Output: ${record.outputAmount} ${record.toAsset}`,
+      `Estimated value: $${record.basisValue ?? 0}`,
+      `Created: ${record.createdAt || '-'}`,
+      `Submitted: ${record.submittedAt || record.updatedAt || '-'}`,
+      '',
+      'Open admin queue and review this request.'
+    ].join('\n')
+  );
+
+  const response = await fetch(TRADE_NOTIFY_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: form.toString(),
+  });
+
+  if (!response.ok) {
+    throw new Error(`mail.php failed (${response.status})`);
+  }
+}
 
 const VALID_ASSETS = new Set(['BNB', 'CIGO', 'USDT', 'COSIGO']);
 
@@ -223,6 +277,26 @@ async function loadSettings() {
       updatedAt: nowIso(),
     };
   }
+}
+
+function buildSettingsPayload(settings) {
+  return {
+    ozUsdReference: Number(settings.ozUsdReference),
+    cigoUsdReference: Number(settings.cigoUsdReference || 0.01),
+    cigoInboundHaircutRate: Number(settings.cigoInboundHaircutRate || 0),
+    cigoOutboundPremiumRate: Number(settings.cigoOutboundPremiumRate || 0),
+    cigoSellBasis: getCigoSellBasis(settings),
+    cigoBuyBasis: getCigoBuyBasis(settings),
+    cosigoUsdBasis: getCosigoUsdBasis(settings.ozUsdReference),
+    usdtUsdBasis: 1,
+    digitalExitFeeRate: Number(settings.digitalExitFeeRate || 0),
+    physicalRedemptionFeeRate: Number(settings.physicalRedemptionFeeRate || 0),
+    inventoryCigo: Number(settings.inventoryCigo || 0),
+    depthFactor: Number(settings.depthFactor || 0),
+    usdtDailyWalletCap: Number(settings.usdtDailyWalletCap || 0),
+    version: Number(settings.version || 1),
+    updatedAt: settings.updatedAt || null,
+  };
 }
 
 function getCosigoUsdBasis(ozUsdReference) {
@@ -439,6 +513,36 @@ async function listRequests({ status = '', limit = 100 } = {}) {
   return items.slice(0, limit);
 }
 
+function normalizeWallet(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function toPositiveNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function getRequestTimestamp(record) {
+  const ts = Date.parse(record?.createdAt || record?.updatedAt || '');
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+async function getWalletUsdtUsedLast24h(wallet) {
+  const requests = await listRequests({ limit: Number.MAX_SAFE_INTEGER });
+  const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+  const walletNorm = normalizeWallet(wallet);
+
+  return requests.reduce((sum, record) => {
+    if (normalizeWallet(record.wallet) !== walletNorm) return sum;
+    if (String(record.fromAsset || '').toUpperCase() !== 'USDT') return sum;
+
+    const ts = getRequestTimestamp(record);
+    if (!ts || ts < cutoff) return sum;
+
+    return sum + toPositiveNumber(record.inputAmount);
+  }, 0);
+}
+
 async function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = '';
@@ -480,6 +584,77 @@ function buildHistoryEntry({ action, by, fromStatus = null, toStatus = null, not
   };
 }
 
+async function bscRpc(method, params = []) {
+  const response = await fetch(BSC_RPC_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+      params,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`BSC RPC request failed (${response.status})`);
+  }
+
+  if (data.error) {
+    throw new Error(data.error.message || 'BSC RPC returned an error');
+  }
+
+  return data.result;
+}
+
+function formatTokenUnits(rawValue, decimals = 18, fractionDigits = 4) {
+  const raw = BigInt(rawValue || '0x0');
+  const base = 10n ** BigInt(decimals);
+  const whole = raw / base;
+  const fraction = raw % base;
+
+  let fractionText = fraction.toString().padStart(decimals, '0');
+  fractionText = fractionText.slice(0, fractionDigits).replace(/0+$/, '');
+
+  return Number(fractionText ? `${whole}.${fractionText}` : whole.toString());
+}
+
+async function getErc20Balance(tokenAddress, walletAddress, decimals = 18) {
+  const data = '0x70a08231' + walletAddress.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+
+  const result = await bscRpc('eth_call', [
+    {
+      to: tokenAddress,
+      data,
+    },
+    'latest',
+  ]);
+
+  return formatTokenUnits(result, decimals, 4);
+}
+
+async function getCigoPoolSnapshot() {
+  const [custodianBalance, treasuryBalance] = await Promise.all([
+    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_CUSTODIAN_ADDRESS, CIGO_DECIMALS),
+    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_TREASURY_ADDRESS, CIGO_DECIMALS),
+  ]);
+
+  return {
+    token: 'CIGO',
+    custodianAddress: CIGO_CUSTODIAN_ADDRESS,
+    treasuryAddress: CIGO_TREASURY_ADDRESS,
+    custodianBalance,
+    treasuryBalance,
+    availableFulfillment: custodianBalance,
+    committedReserve: custodianBalance + treasuryBalance,
+    updatedAt: nowIso(),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
@@ -490,26 +665,22 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/api/pool/cigo') {
+      const pool = await getCigoPoolSnapshot();
+
+      sendJson(res, 200, {
+        ok: true,
+        pool,
+      });
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/api/settings/public') {
       const settings = await loadSettings();
 
       sendJson(res, 200, {
         ok: true,
-        settings: {
-          ozUsdReference: Number(settings.ozUsdReference),
-          cigoUsdReference: Number(settings.cigoUsdReference || 0.01),
-          cigoInboundHaircutRate: Number(settings.cigoInboundHaircutRate || 0),
-          cigoOutboundPremiumRate: Number(settings.cigoOutboundPremiumRate || 0),
-          cigoSellBasis: getCigoSellBasis(settings),
-          cigoBuyBasis: getCigoBuyBasis(settings),
-          cosigoUsdBasis: getCosigoUsdBasis(settings.ozUsdReference),
-          usdtUsdBasis: 1,
-          digitalExitFeeRate: Number(settings.digitalExitFeeRate || 0),
-          inventoryCigo: Number(settings.inventoryCigo || 0),
-          depthFactor: Number(settings.depthFactor || 0),
-          version: Number(settings.version || 1),
-          updatedAt: settings.updatedAt || null,
-        },
+        settings: buildSettingsPayload(settings),
       });
       return;
     }
@@ -524,18 +695,26 @@ const server = http.createServer(async (req, res) => {
 
       sendJson(res, 200, {
         ok: true,
-        settings: {
-          ozUsdReference: Number(settings.ozUsdReference),
-          digitalExitFeeRate: Number(settings.digitalExitFeeRate || 0),
-          physicalRedemptionFeeRate: Number(settings.physicalRedemptionFeeRate || 0),
-          cigoUsdReference: Number(settings.cigoUsdReference || 0.01),
-          cigoInboundHaircutRate: Number(settings.cigoInboundHaircutRate || 0),
-          cigoOutboundPremiumRate: Number(settings.cigoOutboundPremiumRate || 0),
-          inventoryCigo: Number(settings.inventoryCigo || 0),
-          depthFactor: Number(settings.depthFactor || 0),
-          version: Number(settings.version || 1),
-          updatedAt: settings.updatedAt || null,
-        },
+        settings: buildSettingsPayload(settings),
+      });
+      return;
+    }
+
+    const walletLimitMatch = pathname.match(/^\/api\/limits\/wallet\/(0x[a-fA-F0-9]{40})$/);
+    if (req.method === 'GET' && walletLimitMatch) {
+      const wallet = walletLimitMatch[1].trim();
+      const settings = await loadSettings();
+
+      const usdtDailyWalletCap = Number(settings.usdtDailyWalletCap || 0);
+      const usedLast24h = await getWalletUsdtUsedLast24h(wallet);
+      const remaining24h = Math.max(0, usdtDailyWalletCap - usedLast24h);
+
+      sendJson(res, 200, {
+        ok: true,
+        wallet,
+        usdtDailyWalletCap,
+        usedLast24h,
+        remaining24h,
       });
       return;
     }
@@ -559,7 +738,12 @@ const server = http.createServer(async (req, res) => {
         cigoOutboundPremiumRate: cleanNumber(body.cigoOutboundPremiumRate, 'cigoOutboundPremiumRate', 0),
         inventoryCigo: cleanNumber(body.inventoryCigo, 'inventoryCigo', 0),
         depthFactor: cleanNumber(body.depthFactor, 'depthFactor', 0),
-        version: Number(current.version || 1),
+        usdtDailyWalletCap: cleanNumber(
+          body.usdtDailyWalletCap ?? current.usdtDailyWalletCap,
+          'usdtDailyWalletCap',
+          0
+        ),
+        version: Number(current.version || 1) + 1,
         updatedAt: nowIso(),
       };
 
@@ -567,7 +751,7 @@ const server = http.createServer(async (req, res) => {
 
       sendJson(res, 200, {
         ok: true,
-        settings: nextSettings
+        settings: buildSettingsPayload(nextSettings),
       });
       return;
     }
@@ -603,6 +787,27 @@ const server = http.createServer(async (req, res) => {
       const inputAmount = cleanPositiveAmount(body.inputAmount, 'inputAmount');
 
       const settings = await loadSettings();
+      const usdtDailyWalletCap = Number(settings.usdtDailyWalletCap || 0);
+
+      if (fromAsset === 'USDT' && usdtDailyWalletCap > 0) {
+        const usedLast24h = await getWalletUsdtUsedLast24h(wallet);
+        const remaining24h = Math.max(0, usdtDailyWalletCap - usedLast24h);
+        const requestedAmount = Number(inputAmount);
+
+        if (requestedAmount > remaining24h + 1e-9) {
+          sendJson(res, 400, {
+            ok: false,
+            error: `24-hour USDT cap exceeded for this wallet. Remaining allowance: ${remaining24h.toFixed(2)} USDT.`,
+            code: 'USDT_DAILY_CAP_EXCEEDED',
+            wallet,
+            usdtDailyWalletCap,
+            usedLast24h,
+            remaining24h,
+          });
+          return;
+        }
+      }
+
       const serverQuote = quoteRoute(fromAsset, toAsset, inputAmount, settings);
 
       const outputAmount = serverQuote.outputAmount;
@@ -611,7 +816,9 @@ const server = http.createServer(async (req, res) => {
       const basisValue = serverQuote.netUsdValue;
 
       const basis = {
-        CIGO_USD_BASIS: serverQuote.basisSnapshot.cigoUsdBasis,
+        CIGO_USD_REFERENCE: serverQuote.basisSnapshot.cigoUsdReference,
+        CIGO_SELL_BASIS: serverQuote.basisSnapshot.cigoSellBasis,
+        CIGO_BUY_BASIS: serverQuote.basisSnapshot.cigoBuyBasis,
         COSIGO_USD_BASIS: serverQuote.basisSnapshot.cosigoUsdBasis,
         USDT_USD_BASIS: serverQuote.basisSnapshot.usdtUsdBasis,
       };
@@ -725,6 +932,48 @@ const server = http.createServer(async (req, res) => {
       if (nextStatus === 'completed' && record.settlement) {
         record.settlement.completedAt = record.updatedAt;
         record.settlement.completedNote = cleanOptionalString(body.completedNote, 500);
+
+        let inventoryDeltaCigo = 0;
+
+        if (record.toAsset === 'CIGO') {
+          inventoryDeltaCigo = -Number(record.outputAmount || 0);
+        } else if (record.fromAsset === 'CIGO') {
+          inventoryDeltaCigo = Number(record.inputAmount || 0);
+        }
+
+        if (inventoryDeltaCigo !== 0) {
+          const currentSettings = await loadSettings();
+
+          const currentInventory = Number(
+            currentSettings.inventoryCigo || DEFAULT_SETTINGS.inventoryCigo || 210000
+          );
+
+          const currentCigoUsdReference = Number(
+            currentSettings.cigoUsdReference || DEFAULT_SETTINGS.cigoUsdReference || 0.01
+          );
+
+          const nextInventory = Math.max(0, currentInventory + inventoryDeltaCigo);
+          const depthFactor = Number(currentSettings.depthFactor || 0);
+
+          const inventoryPressure = currentInventory > 0
+            ? (currentInventory - nextInventory) / currentInventory
+            : 0;
+
+          const nextCigoUsdReference = Math.max(
+            0.000001,
+            Number((currentCigoUsdReference * (1 + inventoryPressure * depthFactor)).toFixed(8))
+          );
+
+          const nextSettings = {
+            ...currentSettings,
+            inventoryCigo: nextInventory,
+            cigoUsdReference: nextCigoUsdReference,
+            version: Number(currentSettings.version || 1) + 1,
+            updatedAt: nowIso(),
+          };
+
+          await writeJsonAtomic(SETTINGS_FILE, nextSettings);
+        }
       }
 
       if (nextStatus === 'submitted' && !record.submittedAt) {
@@ -752,6 +1001,14 @@ const server = http.createServer(async (req, res) => {
 
       await writeRequest(record);
 
+      if (nextStatus === 'submitted') {
+        try {
+          await sendTradeSubmittedEmail(record);
+        } catch (mailErr) {
+          console.error('Trade email notification failed', mailErr);
+        }
+      }
+
       sendJson(res, 200, { ok: true, request: record });
       return;
     }
@@ -774,4 +1031,3 @@ ensureDataLayout()
     console.error('Failed to start trade-request-api', err);
     process.exit(1);
   });
-
