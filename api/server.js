@@ -16,6 +16,9 @@ const TROY_OUNCE_MG = 31103.4768;
 const CIGO_TOKEN_ADDRESS = '0x3a38e963f524E0dDFB75dFa1752b4Cd1364F5560';
 const CIGO_CUSTODIAN_ADDRESS = '0x2B1B5E58C096d4ab402FEfBaa65f2b1Ddc399399';
 const CIGO_TREASURY_ADDRESS = '0x8215C297A3303449787cCA34bBAed1DF929Fd2a9';
+
+const CIGO_USDT_POOL_ADDRESS = '0xDed1e63B6262C0328876b7774f65c08505dd559A';
+const CIGO_WBNB_POOL_ADDRESS = '0x88DAB085d2b4dc31f8Cf990896d9042EE47C3e19';
 const CIGO_DECIMALS = 18;
 
 const TRADE_NOTIFY_URL = 'https://contact.cosigo.io/api/mail.php';
@@ -31,7 +34,7 @@ const DEFAULT_SETTINGS = {
   cigoInboundHaircutRate: 0.10,
   cigoOutboundPremiumRate: 0.05,
 
-  inventoryCigo: 210000,
+  inventoryCigo: 263040,
   depthFactor: 0.25,
 
   usdtDailyWalletCap: 1000,
@@ -638,19 +641,43 @@ async function getErc20Balance(tokenAddress, walletAddress, decimals = 18) {
 }
 
 async function getCigoPoolSnapshot() {
-  const [custodianBalance, treasuryBalance] = await Promise.all([
+  const [
+    custodianBalance,
+    treasuryBalance,
+    cigoUsdtPoolBalance,
+    cigoWbnbPoolBalance,
+  ] = await Promise.all([
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_CUSTODIAN_ADDRESS, CIGO_DECIMALS),
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_TREASURY_ADDRESS, CIGO_DECIMALS),
+    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_USDT_POOL_ADDRESS, CIGO_DECIMALS),
+    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_WBNB_POOL_ADDRESS, CIGO_DECIMALS),
   ]);
+
+  const poolLiquidityCigo = cigoUsdtPoolBalance + cigoWbnbPoolBalance;
+  const committedReserve = custodianBalance + treasuryBalance;
 
   return {
     token: 'CIGO',
+
     custodianAddress: CIGO_CUSTODIAN_ADDRESS,
     treasuryAddress: CIGO_TREASURY_ADDRESS,
+
+    cigoUsdtPoolAddress: CIGO_USDT_POOL_ADDRESS,
+    cigoWbnbPoolAddress: CIGO_WBNB_POOL_ADDRESS,
+
     custodianBalance,
     treasuryBalance,
-    availableFulfillment: custodianBalance,
-    committedReserve: custodianBalance + treasuryBalance,
+
+    cigoUsdtPoolBalance,
+    cigoWbnbPoolBalance,
+    poolLiquidityCigo,
+
+    // Live PancakeSwap pool CIGO liquidity.
+    availableFulfillment: poolLiquidityCigo,
+
+    // Treasury + custodian reserve display only.
+    committedReserve,
+
     updatedAt: nowIso(),
   };
 }
@@ -874,6 +901,40 @@ const server = http.createServer(async (req, res) => {
 
       const requests = await listRequests({ status, limit });
       sendJson(res, 200, { ok: true, requests });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/requests/latest') {
+      const wallet = cleanString(url.searchParams.get('wallet') || '', 'wallet');
+
+      if (!isEthAddress(wallet)) {
+        sendError(res, 400, 'wallet must be a full 0x address');
+        return;
+      }
+
+      const walletNorm = normalizeWallet(wallet);
+      const requests = await listRequests({ limit: Number.MAX_SAFE_INTEGER });
+
+      const active = requests
+        .filter((record) => normalizeWallet(record.wallet) === walletNorm)
+        .filter((record) => ['reviewed', 'submitted'].includes(String(record.status || '').toLowerCase()))
+        .sort((a, b) => {
+          const aStatus = String(a.status || '').toLowerCase();
+          const bStatus = String(b.status || '').toLowerCase();
+
+          const aHasSettlement = aStatus === 'reviewed' && !!a.settlement?.address;
+          const bHasSettlement = bStatus === 'reviewed' && !!b.settlement?.address;
+
+          if (aHasSettlement !== bHasSettlement) return aHasSettlement ? -1 : 1;
+          if (aStatus !== bStatus) return aStatus === 'reviewed' ? -1 : 1;
+
+          return getRequestTimestamp(b) - getRequestTimestamp(a);
+        });
+
+      sendJson(res, 200, {
+        ok: true,
+        request: active[0] || null,
+      });
       return;
     }
 
