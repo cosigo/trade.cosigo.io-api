@@ -98,9 +98,10 @@ const INTERNAL_ROUTES = new Set([
 
 const STATUS_FLOW = {
   draft: ['submitted'],
-  submitted: ['reviewed'],
-  reviewed: ['completed'],
-  completed: [],
+  submitted: ['reviewed', 'cancelled'],
+  reviewed: ['completed', 'cancelled'],
+  completed: ['cancelled'],
+  cancelled: [],
 };
 
 function nowIso() {
@@ -1047,6 +1048,11 @@ const server = http.createServer(async (req, res) => {
 
       if (nextStatus === 'completed' && !record.completedAt) {
         record.completedAt = record.updatedAt;
+      }
+
+      if (nextStatus === 'cancelled' && !record.cancelledAt) {
+        record.cancelledAt = record.updatedAt;
+        record.cancelledNote = cleanOptionalString(body.note || 'Cancelled by admin', 500);
       }
 
       record.history = Array.isArray(record.history) ? record.history : [];
