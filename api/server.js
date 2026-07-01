@@ -760,15 +760,16 @@ async function getCigoPoolSnapshot() {
     custodianBalance,
     treasuryBalance,
     cigoUsdtPoolBalance,
-    cigoWbnbPoolBalance,
   ] = await Promise.all([
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_CUSTODIAN_ADDRESS, CIGO_DECIMALS),
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_TREASURY_ADDRESS, CIGO_DECIMALS),
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_USDT_POOL_ADDRESS, CIGO_DECIMALS),
-    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_WBNB_POOL_ADDRESS, CIGO_DECIMALS),
   ]);
 
-  const poolLiquidityCigo = cigoUsdtPoolBalance + cigoWbnbPoolBalance;
+  // Active liquidity now means only the CIGO / BSC-USD PancakeSwap V2 pair.
+  // The old CIGO / WBNB pair is historical/inactive and is not counted.
+  const cigoWbnbPoolBalance = 0;
+  const poolLiquidityCigo = cigoUsdtPoolBalance;
   const committedReserve = custodianBalance + treasuryBalance;
 
   return {
