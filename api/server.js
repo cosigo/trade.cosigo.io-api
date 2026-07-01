@@ -25,9 +25,9 @@ const BSC_USD_TOKEN_ADDRESS = '0x55d398326f99059fF775485246999027B3197955';
 const PANCAKE_V2_ROUTER_ADDRESS = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 
 // Request-desk CIGO -> USDT exits must not exceed live pool reality.
-// 9975 bps = live Pancake router estimate minus 0.25% safety buffer.
-const CIGO_TO_USDT_REQUEST_POOL_CAP_BPS = 9975;
-const USDT_TO_CIGO_REQUEST_POOL_CAP_BPS = 9975;
+// 10025 bps = live Pancake router estimate plus 0.25% manual desk premium.
+const CIGO_TO_USDT_REQUEST_POOL_CAP_BPS = 10025;
+const USDT_TO_CIGO_REQUEST_POOL_CAP_BPS = 10025;
 
 const TRADE_NOTIFY_URL = 'https://contact.cosigo.io/api/mail.php';
 const TRADE_NOTIFY_NAME = 'trade.cosigo.io notifier';
