@@ -27,6 +27,7 @@ const PANCAKE_V2_ROUTER_ADDRESS = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 // Request-desk CIGO -> USDT exits must not exceed live pool reality.
 // 9975 bps = live Pancake router estimate minus 0.25% safety buffer.
 const CIGO_TO_USDT_REQUEST_POOL_CAP_BPS = 9975;
+const USDT_TO_CIGO_REQUEST_POOL_CAP_BPS = 9975;
 
 const TRADE_NOTIFY_URL = 'https://contact.cosigo.io/api/mail.php';
 const TRADE_NOTIFY_NAME = 'trade.cosigo.io notifier';
@@ -409,6 +410,9 @@ async function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
   let cigoManualUsdValue = null;
   let cigoPoolRouterUsdValue = null;
   let cigoPoolCappedUsdValue = null;
+  let cigoManualOutputAmount = null;
+  let cigoPoolRouterOutputAmount = null;
+  let cigoPoolCappedOutputAmount = null;
 
   if (pricing.type === 'usdt_to_cosigo') {
     grossUsdValue = inputNum;
@@ -424,7 +428,15 @@ async function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
     grossUsdValue = inputNum;
     feeUsdValue = 0;
     netUsdValue = grossUsdValue;
-    outputAmountNum = netUsdValue / cigoBuyBasis;
+
+    cigoManualOutputAmount = netUsdValue / cigoBuyBasis;
+    cigoPoolRouterOutputAmount = await getPancakeRouterAmountOutHuman(
+      inputAmount,
+      [BSC_USD_TOKEN_ADDRESS, CIGO_TOKEN_ADDRESS]
+    );
+    cigoPoolCappedOutputAmount = cigoPoolRouterOutputAmount * (USDT_TO_CIGO_REQUEST_POOL_CAP_BPS / 10000);
+
+    outputAmountNum = Math.min(cigoManualOutputAmount, cigoPoolCappedOutputAmount);
   } else if (pricing.type === 'cigo_to_usdt') {
     cigoManualUsdValue = inputNum * cigoSellBasis;
     cigoPoolRouterUsdValue = await getPancakeRouterAmountOutHuman(
@@ -432,6 +444,10 @@ async function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
       [CIGO_TOKEN_ADDRESS, BSC_USD_TOKEN_ADDRESS]
     );
     cigoPoolCappedUsdValue = cigoPoolRouterUsdValue * (CIGO_TO_USDT_REQUEST_POOL_CAP_BPS / 10000);
+
+    cigoManualOutputAmount = cigoManualUsdValue;
+    cigoPoolRouterOutputAmount = cigoPoolRouterUsdValue;
+    cigoPoolCappedOutputAmount = cigoPoolCappedUsdValue;
 
     grossUsdValue = Math.min(cigoManualUsdValue, cigoPoolCappedUsdValue);
     feeUsdValue = 0;
@@ -467,7 +483,14 @@ async function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
     cigoManualUsdValue,
     cigoPoolRouterUsdValue,
     cigoPoolCappedUsdValue,
-    cigoRequestPoolCapBps: pricing.type === 'cigo_to_usdt' ? CIGO_TO_USDT_REQUEST_POOL_CAP_BPS : null,
+    cigoManualOutputAmount,
+    cigoPoolRouterOutputAmount,
+    cigoPoolCappedOutputAmount,
+    cigoRequestPoolCapBps: pricing.type === 'cigo_to_usdt'
+      ? CIGO_TO_USDT_REQUEST_POOL_CAP_BPS
+      : pricing.type === 'usdt_to_cigo'
+        ? USDT_TO_CIGO_REQUEST_POOL_CAP_BPS
+        : null,
     basisSnapshot: {
       ozUsdReference: Number(settings.ozUsdReference),
       cosigoUsdBasis,
@@ -916,6 +939,9 @@ const server = http.createServer(async (req, res) => {
           cigoManualUsdValue: serverQuote.cigoManualUsdValue,
           cigoPoolRouterUsdValue: serverQuote.cigoPoolRouterUsdValue,
           cigoPoolCappedUsdValue: serverQuote.cigoPoolCappedUsdValue,
+          cigoManualOutputAmount: serverQuote.cigoManualOutputAmount,
+          cigoPoolRouterOutputAmount: serverQuote.cigoPoolRouterOutputAmount,
+          cigoPoolCappedOutputAmount: serverQuote.cigoPoolCappedOutputAmount,
           cigoRequestPoolCapBps: serverQuote.cigoRequestPoolCapBps,
           basisSnapshot: serverQuote.basisSnapshot
         }
