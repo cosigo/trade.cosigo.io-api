@@ -21,6 +21,13 @@ const CIGO_USDT_POOL_ADDRESS = '0xDed1e63B6262C0328876b7774f65c08505dd559A';
 const CIGO_WBNB_POOL_ADDRESS = '0x88DAB085d2b4dc31f8Cf990896d9042EE47C3e19';
 const CIGO_DECIMALS = 18;
 
+const BSC_USD_TOKEN_ADDRESS = '0x55d398326f99059fF775485246999027B3197955';
+const PANCAKE_V2_ROUTER_ADDRESS = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+
+// Request-desk CIGO -> USDT exits must not exceed live pool reality.
+// 9975 bps = live Pancake router estimate minus 0.25% safety buffer.
+const CIGO_TO_USDT_REQUEST_POOL_CAP_BPS = 9975;
+
 const TRADE_NOTIFY_URL = 'https://contact.cosigo.io/api/mail.php';
 const TRADE_NOTIFY_NAME = 'trade.cosigo.io notifier';
 const TRADE_NOTIFY_EMAIL = process.env.TRADE_NOTIFY_EMAIL || 'admin@cosigo.io';
@@ -377,7 +384,7 @@ function formatAmount(value, digits = 18) {
   return num.toFixed(digits).replace(/\.?0+$/, '');
 }
 
-function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
+async function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
   const inputNum = Number(inputAmount);
   if (!Number.isFinite(inputNum) || inputNum <= 0) {
     throw new Error('inputAmount must be greater than zero');
@@ -399,6 +406,10 @@ function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
   let netUsdValue = 0;
   let outputAmountNum = 0;
 
+  let cigoManualUsdValue = null;
+  let cigoPoolRouterUsdValue = null;
+  let cigoPoolCappedUsdValue = null;
+
   if (pricing.type === 'usdt_to_cosigo') {
     grossUsdValue = inputNum;
     feeUsdValue = 0;
@@ -415,7 +426,14 @@ function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
     netUsdValue = grossUsdValue;
     outputAmountNum = netUsdValue / cigoBuyBasis;
   } else if (pricing.type === 'cigo_to_usdt') {
-    grossUsdValue = inputNum * cigoSellBasis;
+    cigoManualUsdValue = inputNum * cigoSellBasis;
+    cigoPoolRouterUsdValue = await getPancakeRouterAmountOutHuman(
+      inputAmount,
+      [CIGO_TOKEN_ADDRESS, BSC_USD_TOKEN_ADDRESS]
+    );
+    cigoPoolCappedUsdValue = cigoPoolRouterUsdValue * (CIGO_TO_USDT_REQUEST_POOL_CAP_BPS / 10000);
+
+    grossUsdValue = Math.min(cigoManualUsdValue, cigoPoolCappedUsdValue);
     feeUsdValue = 0;
     netUsdValue = grossUsdValue;
     outputAmountNum = netUsdValue;
@@ -446,6 +464,10 @@ function quoteRoute(fromAsset, toAsset, inputAmount, settings) {
     netUsdValue,
     outputAmount: formatAmount(outputAmountNum, outputDigits),
     feeAmount: formatAmount(feeUsdValue, 6),
+    cigoManualUsdValue,
+    cigoPoolRouterUsdValue,
+    cigoPoolCappedUsdValue,
+    cigoRequestPoolCapBps: pricing.type === 'cigo_to_usdt' ? CIGO_TO_USDT_REQUEST_POOL_CAP_BPS : null,
     basisSnapshot: {
       ozUsdReference: Number(settings.ozUsdReference),
       cosigoUsdBasis,
@@ -613,6 +635,75 @@ async function bscRpc(method, params = []) {
   }
 
   return data.result;
+}
+
+function encodeEthAddress(address) {
+  return String(address || '').toLowerCase().replace(/^0x/, '').padStart(64, '0');
+}
+
+function encodeUint256(value) {
+  return BigInt(value).toString(16).padStart(64, '0');
+}
+
+function parseTokenUnits(value, decimals = 18) {
+  const clean = String(value || '').trim().replace(/,/g, '');
+  if (!/^\d+(\.\d+)?$/.test(clean)) {
+    throw new Error('Invalid token amount');
+  }
+
+  const [whole, frac = ''] = clean.split('.');
+  return BigInt((whole + frac.slice(0, decimals).padEnd(decimals, '0')).replace(/^0+(?=\d)/, '') || '0');
+}
+
+function formatRawTokenUnits(rawValue, decimals = 18, fractionDigits = 12) {
+  const raw = BigInt(rawValue || 0);
+  const base = 10n ** BigInt(decimals);
+  const whole = raw / base;
+  const fraction = raw % base;
+
+  let fractionText = fraction.toString().padStart(decimals, '0');
+  fractionText = fractionText.slice(0, fractionDigits).replace(/0+$/, '');
+
+  return fractionText ? `${whole}.${fractionText}` : whole.toString();
+}
+
+function encodeGetAmountsOutData(amountInRaw, path) {
+  const selector = 'd06ca61f';
+  const offset = encodeUint256(64n);
+  const length = encodeUint256(BigInt(path.length));
+
+  return '0x' + selector +
+    encodeUint256(amountInRaw) +
+    offset +
+    length +
+    path.map(encodeEthAddress).join('');
+}
+
+function decodeGetAmountsOutLast(raw) {
+  const hex = String(raw || '').replace(/^0x/, '');
+  if (hex.length < 256) {
+    throw new Error('Pancake router returned no usable output amount');
+  }
+
+  return BigInt('0x' + hex.slice(-64));
+}
+
+async function getPancakeRouterAmountOutHuman(amountIn, path) {
+  const amountInRaw = parseTokenUnits(amountIn, 18);
+
+  const raw = await bscRpc('eth_call', [{
+    to: PANCAKE_V2_ROUTER_ADDRESS,
+    data: encodeGetAmountsOutData(amountInRaw, path),
+  }, 'latest']);
+
+  const outRaw = decodeGetAmountsOutLast(raw);
+  const outHuman = Number(formatRawTokenUnits(outRaw, 18, 12));
+
+  if (!Number.isFinite(outHuman) || outHuman <= 0) {
+    throw new Error('Invalid Pancake router quote');
+  }
+
+  return outHuman;
 }
 
 function formatTokenUnits(rawValue, decimals = 18, fractionDigits = 4) {
@@ -784,6 +875,54 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/api/quote/preview') {
+      const body = await parseJsonBody(req);
+
+      const fromAsset = cleanString(body.fromAsset, 'fromAsset').toUpperCase();
+      const toAsset = cleanString(body.toAsset, 'toAsset').toUpperCase();
+
+      if (!VALID_ASSETS.has(fromAsset) || !VALID_ASSETS.has(toAsset)) {
+        throw new Error('Invalid asset symbol');
+      }
+
+      if (fromAsset === toAsset) {
+        throw new Error('fromAsset and toAsset must be different');
+      }
+
+      const routeType = getRouteType(fromAsset, toAsset);
+      if (routeType === 'unsupported') {
+        throw new Error('Unsupported route');
+      }
+
+      if (routeType === 'external_market') {
+        throw new Error('BNB routes are external-market-only and not server-settled here');
+      }
+
+      const inputAmount = cleanPositiveAmount(body.inputAmount, 'inputAmount');
+      const settings = await loadSettings();
+      const serverQuote = await quoteRoute(fromAsset, toAsset, inputAmount, settings);
+
+      sendJson(res, 200, {
+        ok: true,
+        quote: {
+          fromAsset,
+          toAsset,
+          inputAmount,
+          outputAmount: serverQuote.outputAmount,
+          basisValue: serverQuote.netUsdValue,
+          feeAmount: serverQuote.feeAmount,
+          feeRate: serverQuote.feeRate,
+          pricingPolicy: serverQuote.pricingPolicy,
+          cigoManualUsdValue: serverQuote.cigoManualUsdValue,
+          cigoPoolRouterUsdValue: serverQuote.cigoPoolRouterUsdValue,
+          cigoPoolCappedUsdValue: serverQuote.cigoPoolCappedUsdValue,
+          cigoRequestPoolCapBps: serverQuote.cigoRequestPoolCapBps,
+          basisSnapshot: serverQuote.basisSnapshot
+        }
+      });
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/api/requests/create') {
       const body = await parseJsonBody(req);
 
@@ -836,7 +975,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const serverQuote = quoteRoute(fromAsset, toAsset, inputAmount, settings);
+      const serverQuote = await quoteRoute(fromAsset, toAsset, inputAmount, settings);
 
       const outputAmount = serverQuote.outputAmount;
       const feeAmount = serverQuote.feeAmount;
