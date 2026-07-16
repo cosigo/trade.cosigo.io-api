@@ -14,8 +14,30 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const TROY_OUNCE_MG = 31103.4768;
 
 const CIGO_TOKEN_ADDRESS = '0x3a38e963f524E0dDFB75dFa1752b4Cd1364F5560';
+
+// Keep the original hot wallet as the public operational address.
+// Public status balances include this wallet plus six cold-reserve wallets.
 const CIGO_CUSTODIAN_ADDRESS = '0x2B1B5E58C096d4ab402FEfBaa65f2b1Ddc399399';
+const CIGO_CUSTODIAN_ADDRESSES = Object.freeze([
+  CIGO_CUSTODIAN_ADDRESS,
+  '0x79dCF2193ADbf55BD939A27ce0ceF2C00E9a4581',
+  '0x8b04dE4C80e7e53Fca0161D373cb422126D2D86B',
+  '0x02b50D68F280366eFD023b29e898309AF3E76D85',
+  '0xE2A283Cc2044a7E491E88b07a23878adb0F52821',
+  '0x42d92243221689d25A12A8F70a7EcD0b36C445CE',
+  '0x0290c6871737A878030F8CaB6028b81134706B9E',
+]);
+
 const CIGO_TREASURY_ADDRESS = '0x8215C297A3303449787cCA34bBAed1DF929Fd2a9';
+const CIGO_TREASURY_ADDRESSES = Object.freeze([
+  CIGO_TREASURY_ADDRESS,
+  '0x8b338D956Cc4e37Cb23888e0e770cF90f4E7A5C6',
+  '0xdb277Bc72F03f6a03E87Def04661C72d432708C9',
+  '0x57646334fD19940A2519b170462670e021435c4D',
+  '0x12cEB37E944027687b274AA3e4237c43E33144fC',
+  '0xD86698484dBD728Abf771864e956398BCf7ef3bd',
+  '0x74851b92351D0D13eE8B19eF73CA2C2FA270A168',
+]);
 
 const CIGO_USDT_POOL_ADDRESS = '0xDed1e63B6262C0328876b7774f65c08505dd559A';
 const CIGO_WBNB_POOL_ADDRESS = '0x88DAB085d2b4dc31f8Cf990896d9042EE47C3e19';
@@ -755,14 +777,32 @@ async function getErc20Balance(tokenAddress, walletAddress, decimals = 18) {
   return formatTokenUnits(result, decimals, 4);
 }
 
+async function getCombinedErc20Balance(tokenAddress, walletAddresses, decimals = 18) {
+  const balances = await Promise.all(
+    walletAddresses.map((walletAddress) =>
+      getErc20Balance(tokenAddress, walletAddress, decimals)
+    )
+  );
+
+  return balances.reduce((total, balance) => total + balance, 0);
+}
+
 async function getCigoPoolSnapshot() {
   const [
     custodianBalance,
     treasuryBalance,
     cigoUsdtPoolBalance,
   ] = await Promise.all([
-    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_CUSTODIAN_ADDRESS, CIGO_DECIMALS),
-    getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_TREASURY_ADDRESS, CIGO_DECIMALS),
+    getCombinedErc20Balance(
+      CIGO_TOKEN_ADDRESS,
+      CIGO_CUSTODIAN_ADDRESSES,
+      CIGO_DECIMALS
+    ),
+    getCombinedErc20Balance(
+      CIGO_TOKEN_ADDRESS,
+      CIGO_TREASURY_ADDRESSES,
+      CIGO_DECIMALS
+    ),
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_USDT_POOL_ADDRESS, CIGO_DECIMALS),
   ]);
 
@@ -775,8 +815,13 @@ async function getCigoPoolSnapshot() {
   return {
     token: 'CIGO',
 
+    // Singular addresses remain the public operational hot-wallet links.
     custodianAddress: CIGO_CUSTODIAN_ADDRESS,
     treasuryAddress: CIGO_TREASURY_ADDRESS,
+
+    // Complete public reserve groups used for the displayed totals.
+    custodianAddresses: CIGO_CUSTODIAN_ADDRESSES,
+    treasuryAddresses: CIGO_TREASURY_ADDRESSES,
 
     cigoUsdtPoolAddress: CIGO_USDT_POOL_ADDRESS,
     cigoWbnbPoolAddress: CIGO_WBNB_POOL_ADDRESS,
