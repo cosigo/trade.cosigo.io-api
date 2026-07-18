@@ -787,6 +787,56 @@ async function getCombinedErc20Balance(tokenAddress, walletAddresses, decimals =
   return balances.reduce((total, balance) => total + balance, 0);
 }
 
+async function getCigoUsdtPoolSpotPrice() {
+  const [reservesResult, token0Result] = await Promise.all([
+    bscRpc('eth_call', [
+      {
+        to: CIGO_USDT_POOL_ADDRESS,
+        data: '0x0902f1ac',
+      },
+      'latest',
+    ]),
+    bscRpc('eth_call', [
+      {
+        to: CIGO_USDT_POOL_ADDRESS,
+        data: '0x0dfe1681',
+      },
+      'latest',
+    ]),
+  ]);
+
+  const reservesHex = String(reservesResult || '').replace(/^0x/, '');
+  const token0Hex = String(token0Result || '').replace(/^0x/, '');
+
+  if (reservesHex.length < 128 || token0Hex.length < 40) {
+    throw new Error('Invalid CIGO/BSC-USD pair response');
+  }
+
+  const reserve0 = BigInt(`0x${reservesHex.slice(0, 64)}`);
+  const reserve1 = BigInt(`0x${reservesHex.slice(64, 128)}`);
+  const token0 = `0x${token0Hex.slice(-40)}`.toLowerCase();
+  const cigo = CIGO_TOKEN_ADDRESS.toLowerCase();
+  const bscUsd = BSC_USD_TOKEN_ADDRESS.toLowerCase();
+
+  const cigoReserve =
+    token0 === cigo ? reserve0 : token0 === bscUsd ? reserve1 : 0n;
+  const bscUsdReserve =
+    token0 === bscUsd ? reserve0 : token0 === cigo ? reserve1 : 0n;
+
+  if (cigoReserve === 0n || bscUsdReserve === 0n) {
+    throw new Error('Unexpected or empty CIGO/BSC-USD pair reserves');
+  }
+
+  // Both tokens use 18 decimals, so the raw reserve ratio is BSC-USD per CIGO.
+  const spotPrice = Number(bscUsdReserve) / Number(cigoReserve);
+
+  if (!Number.isFinite(spotPrice) || spotPrice <= 0) {
+    throw new Error('Invalid CIGO/BSC-USD spot price');
+  }
+
+  return spotPrice;
+}
+
 async function getCigoPoolSnapshot() {
   const [
     custodianBalance,
@@ -805,6 +855,15 @@ async function getCigoPoolSnapshot() {
     ),
     getErc20Balance(CIGO_TOKEN_ADDRESS, CIGO_USDT_POOL_ADDRESS, CIGO_DECIMALS),
   ]);
+
+  // Read price after the wallet balance burst to avoid public-RPC concurrency limits.
+  let cigoPoolSpotUsd = null;
+
+  try {
+    cigoPoolSpotUsd = await getCigoUsdtPoolSpotPrice();
+  } catch (err) {
+    console.error('CIGO pool spot price unavailable:', err.message || err);
+  }
 
   // Active liquidity now means only the CIGO / BSC-USD PancakeSwap V2 pair.
   // The old CIGO / WBNB pair is historical/inactive and is not counted.
@@ -832,6 +891,7 @@ async function getCigoPoolSnapshot() {
     cigoUsdtPoolBalance,
     cigoWbnbPoolBalance,
     poolLiquidityCigo,
+    cigoPoolSpotUsd,
 
     // Live PancakeSwap pool CIGO liquidity.
     availableFulfillment: poolLiquidityCigo,
@@ -855,6 +915,17 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname === '/api/pool/cigo') {
       const pool = await getCigoPoolSnapshot();
+
+      const requestOrigin = req.headers.origin;
+      const allowedPoolOrigins = new Set([
+        'https://market.cosigo.io',
+        'https://quote.cosigo.io',
+      ]);
+
+      if (allowedPoolOrigins.has(requestOrigin)) {
+        res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+        res.setHeader('Vary', 'Origin');
+      }
 
       sendJson(res, 200, {
         ok: true,
